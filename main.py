@@ -1,172 +1,138 @@
 import requests
-from PIL import Image
+from bs4 import BeautifulSoup
+import time
 import os
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed # Import mới
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fpdf import FPDF
+import glob
 
-def download_image(image_url):
-    """
-    Tải xuống một hình ảnh duy nhất.
-    Trả về đối tượng PIL Image nếu thành công, None nếu thất bại.
-    """
-    try:
-        response = requests.get(image_url, stream=True, timeout=10) # Thêm timeout
-        response.raise_for_status()
+# --- THIẾT LẬP CƠ BẢN ---
+TRUYEN_SLUG = "quy-khoc-quy-xa"
+URL_GOC = "https://vozer.io/"
+CHUONG_BAT_DAU = 1
+CHUONG_KET_THUC = 1031
+THU_MUC_LUU = f"truyen_{TRUYEN_SLUG}_PDF"
+SO_LUONG_TOI_DA = 10  # Số luồng tải cùng lúc (có thể tăng lên 10–20 nếu mạng khỏe)
+# ------------------------
 
-        if 'image' not in response.headers.get('Content-Type', ''):
-            print(f"URL {image_url} không trả về hình ảnh hợp lệ.")
-            return None
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+    'Accept-Language': 'vi-VN,vi;q=0.9',
+    'Referer': f'{URL_GOC}{TRUYEN_SLUG}/',
+}
 
-        img = Image.open(BytesIO(response.content))
-        # print(f"Đã tải xuống: {image_url}") # Có thể tắt nếu quá nhiều thông báo
-        return img
-    except requests.exceptions.RequestException as e:
-        print(f"Lỗi tải xuống {image_url}: {e}")
-        return None
-    except Exception as e:
-        print(f"Lỗi xử lý hình ảnh {image_url}: {e}")
-        return None
+FONT_PATH = None
 
-def download_chapter_images_threaded(base_url_img, max_workers=8, start_image_index=0):
-    """
-    Tải xuống tất cả các hình ảnh của một chương truyện sử dụng đa luồng.
+# --- HÀM TÌM FONT UNICODE ---
+def find_unicode_font():
+    font_paths = [
+        '/usr/share/fonts/truetype/**/Arial.ttf',
+        '/usr/share/fonts/truetype/**/DejaVuSans.ttf',
+        'C:/Windows/Fonts/arialuni.ttf',
+        'C:/Windows/Fonts/arial.ttf',
+        '/System/Library/Fonts/Supplemental/Arial.ttf'
+    ]
+    for path in font_paths:
+        found = glob.glob(path, recursive=True)
+        if found:
+            return found[0]
+    return None
 
-    Args:
-        base_url_img (str): URL cơ sở của hình ảnh, ví dụ: "https://file.nhasachmienphi.com/jpg/nhasachmienphi-fairy-tail-hoi-phap_su-noi-tieng-326548-{}.jpg"
-        max_workers (int): Số lượng luồng tối đa để tải ảnh trong một chương.
-        start_image_index (int): Chỉ số bắt đầu của hình ảnh (thường là 0).
+# --- LỚP PDF ---
+class PDF(FPDF):
+    def __init__(self):
+        super().__init__()
+        if FONT_PATH:
+            self.add_font("CustomFont", style="", fname=FONT_PATH)
+            self.add_font("CustomFont", style="B", fname=FONT_PATH)  # thêm font bold
+            self.set_font("CustomFont", size=11)
+        else:
+            self.set_font("Arial", size=11)
+        self.set_auto_page_break(auto=True, margin=15)
 
-    Returns:
-        list: Danh sách các đối tượng hình ảnh PIL đã tải xuống, đã sắp xếp.
-    """
-    chapter_images_map = {} # Dùng để lưu trữ ảnh theo index để sắp xếp
-    futures = []
+    def header(self):
+        self.set_font("Arial" if FONT_PATH is None else "CustomFont", size=9)
+        self.cell(0, 10, TRUYEN_SLUG, 0, new_x="LMARGIN", new_y="NEXT", align='R')
 
-    # Giới hạn số lượng yêu cầu ban đầu để tìm ra số lượng ảnh thực tế
-    # Sau đó mới tạo thêm các yêu cầu khác nếu cần
-    initial_check_count = 500 # Giả định tối đa 500 ảnh cho mỗi chương. Có thể tăng/giảm.
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Arial" if FONT_PATH is None else "CustomFont", size=8)
+        self.cell(0, 10, f"Trang {self.page_no()}", 0, new_x="LMARGIN", new_y="NEXT", align='C')
 
-    print(f"Đang tìm kiếm và tải ảnh cho chương...")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for i in range(start_image_index, start_image_index + initial_check_count):
-            image_url = base_url_img.format(i)
-            future = executor.submit(download_image, image_url)
-            futures.append((i, future)) # Lưu trữ cả index và future
-
-        # Chờ và xử lý kết quả
-        found_last_image = False
-        for index, future in sorted(futures, key=lambda x: x[0]):
-            img = future.result()
-            if img:
-                chapter_images_map[index] = img
-                found_last_image = True # Đã tìm thấy ít nhất 1 ảnh
-            else:
-                # Nếu không tải được ảnh (lỗi 404 hoặc không hợp lệ), coi như đã hết ảnh
-                # Chỉ dừng nếu không có ảnh nào được tìm thấy ở các index cao hơn
-                if found_last_image and index not in chapter_images_map:
-                    # Kiểm tra xem có phải đây là ảnh cuối cùng không
-                    # Logic này có thể cần tinh chỉnh nếu có những khoảng trống trong index ảnh
-                    pass # Tiếp tục kiểm tra các ảnh tiếp theo trong initial_check_count
-                else:
-                    break # Nếu ảnh đầu tiên không có, hoặc có lỗ hổng lớn, dừng
-
-    # Sắp xếp lại ảnh theo thứ tự index
-    sorted_images = [chapter_images_map[i] for i in sorted(chapter_images_map.keys())]
-    print(f"Đã tải được {len(sorted_images)} hình ảnh cho chương.")
-    return sorted_images
-
-def create_pdf_from_images(images, output_filename):
-    """
-    Tạo file PDF từ danh sách các đối tượng hình ảnh PIL.
-    """
-    if not images:
-        print(f"Không có hình ảnh để tạo PDF cho {output_filename}.")
-        return
+# --- HÀM TẢI 1 CHƯƠNG ---
+def tai_chuong(so_chuong):
+    url = f"{URL_GOC}{TRUYEN_SLUG}/chuong-{so_chuong}"
+    s = requests.Session()
+    s.headers.update(HEADERS)
 
     try:
-        rgb_images = []
-        for img in images:
-            if img.mode == 'RGBA':
-                img = img.convert('RGB')
-            rgb_images.append(img)
+        r = s.get(url, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException:
+        return so_chuong, None, None
 
-        rgb_images[0].save(output_filename, save_all=True, append_images=rgb_images[1:])
-        print(f"Đã tạo file PDF: {output_filename}")
-    except Exception as e:
-        print(f"Lỗi khi tạo PDF {output_filename}: {e}")
+    soup = BeautifulSoup(r.text, "html.parser")
+    chapter_container = soup.find('div', id='chapter-001') or \
+                        soup.find('div', id=f'chapter-{so_chuong}') or \
+                        soup.find('div', class_='font-content')
 
-def download_manga_series_threaded(start_chapter_id, end_chapter_id, series_name="Fairy Tail_Manga", max_chapter_workers=2, max_image_workers_per_chapter=8):
-    """
-    Tải xuống toàn bộ series truyện tranh sử dụng đa luồng cho cả chương và ảnh.
+    if not chapter_container:
+        return so_chuong, None, None
 
-    Args:
-        start_chapter_id (int): ID của chương bắt đầu.
-        end_chapter_id (int): ID của chương kết thúc.
-        series_name (str): Tên của bộ truyện (để tạo thư mục).
-        max_chapter_workers (int): Số lượng chương tối đa được tải song song.
-        max_image_workers_per_chapter (int): Số lượng luồng tối đa để tải ảnh trong một chương.
-    """
-    output_dir = os.path.join(os.getcwd(), series_name)
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Các file PDF sẽ được lưu vào thư mục: {output_dir}")
+    tieu_de_element = chapter_container.find('h1')
+    tieu_de = tieu_de_element.text.strip() if tieu_de_element else f"Chương {so_chuong}"
 
-    # Sử dụng ThreadPoolExecutor để xử lý các chương song song
-    with ThreadPoolExecutor(max_workers=max_chapter_workers) as chapter_executor:
-        chapter_futures = []
-        for chapter_id in range(start_chapter_id, end_chapter_id + 1):
-            chapter_filename = os.path.join(output_dir, f"{series_name}_Chapter_{chapter_id}.pdf")
-            if os.path.exists(chapter_filename):
-                print(f"File {chapter_filename} đã tồn tại, bỏ qua chương này.")
-                continue
+    noi_dung_element = chapter_container.find('div', id='content')
+    paragraphs = (noi_dung_element or chapter_container).find_all('p')
+    noi_dung = "\n\n".join(p.text.strip() for p in paragraphs if p.text.strip())
 
-            chapter_futures.append(
-                chapter_executor.submit(
-                    process_single_chapter,
-                    chapter_id,
-                    series_name,
-                    chapter_filename,
-                    max_image_workers_per_chapter
-                )
-            )
+    return so_chuong, tieu_de, noi_dung or "Nội dung không tải được."
 
-        # Chờ tất cả các chương hoàn thành
-        for future in as_completed(chapter_futures):
-            try:
-                future.result() # Lấy kết quả nếu cần, hoặc để kiểm tra lỗi
-            except Exception as e:
-                print(f"Lỗi khi xử lý một chương: {e}")
+# --- HÀM LƯU PDF ---
+def luu_pdf(so_chuong, tieu_de, noi_dung, folder_path):
+    ten_file_pdf = f"{TRUYEN_SLUG}_chuong_{so_chuong:04d}.pdf"
+    duong_dan_file = os.path.join(folder_path, ten_file_pdf)
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Arial" if FONT_PATH is None else "CustomFont", style="B", size=14)
+    pdf.multi_cell(0, 10, f"Chương {so_chuong}: {tieu_de}")
+    pdf.ln(5)
+    pdf.set_font("Arial" if FONT_PATH is None else "CustomFont", size=11)
+    pdf.multi_cell(0, 7, noi_dung)
+    pdf.output(duong_dan_file)
 
-def process_single_chapter(chapter_id, series_name, chapter_filename, max_image_workers_per_chapter):
-    """
-    Hàm xử lý một chương duy nhất, dùng trong ThreadPoolExecutor.
-    """
-    print(f"\nĐang xử lý chương: {chapter_id}")
-    base_url_img = f"https://file.nhasachmienphi.com/jpg/nhasachmienphi-fairy-tail-hoi-phap_su-noi-tieng-{chapter_id}-{{}}.jpg"
-
-    images = download_chapter_images_threaded(base_url_img, max_workers=max_image_workers_per_chapter)
-    if images:
-        create_pdf_from_images(images, chapter_filename)
-    else:
-        print(f"Không tìm thấy hình ảnh cho chương {chapter_id}. Có thể chương này chưa có hoặc ID không đúng.")
-
-
-# --- Cấu hình và chạy ---
+# --- MAIN ---
 if __name__ == "__main__":
-    # Thay đổi các giá trị này theo nhu cầu của bạn
-    start_id = 326548  # ID của chương đầu tiên bạn muốn tải
-    end_id = 327092    # ID của chương cuối cùng bạn muốn tải (ví dụ: đến chương 326550)
+    print("🔍 Đang tìm font Unicode...")
+    FONT_PATH = find_unicode_font()
+    if FONT_PATH:
+        print(f"✅ Font Unicode: {FONT_PATH}")
+    else:
+        print("⚠️ Không tìm thấy font Unicode. Có thể lỗi tiếng Việt.")
 
-    # Cấu hình số lượng luồng
-    # Với 4 luồng CPU, bạn có thể thử max_chapter_workers = 2 hoặc 3 (để lại 1 luồng cho hệ thống)
-    # max_image_workers_per_chapter nên từ 8-16, tùy thuộc vào độ ổn định của server.
-    MAX_CHAPTER_WORKERS = 2 # Số chương được xử lý song song
-    MAX_IMAGE_WORKERS_PER_CHAPTER = 10 # Số ảnh được tải song song trong một chương
+    if not os.path.exists(THU_MUC_LUU):
+        os.makedirs(THU_MUC_LUU)
 
-    download_manga_series_threaded(
-        start_id,
-        end_id,
-        series_name="Fairy_Tail_Hoi_Phap_Su",
-        max_chapter_workers=MAX_CHAPTER_WORKERS,
-        max_image_workers_per_chapter=MAX_IMAGE_WORKERS_PER_CHAPTER
-    )
-    print("\nQuá trình tải xuống và chuyển đổi đã hoàn tất!")
+    tong_so = CHUONG_KET_THUC - CHUONG_BAT_DAU + 1
+    thanh_cong = 0
+
+    print(f"🚀 Bắt đầu tải {tong_so} chương bằng {SO_LUONG_TOI_DA} luồng...\n")
+
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=SO_LUONG_TOI_DA) as executor:
+        futures = [executor.submit(tai_chuong, i) for i in range(CHUONG_BAT_DAU, CHUONG_KET_THUC + 1)]
+
+        for future in as_completed(futures):
+            so_chuong, tieu_de, noi_dung = future.result()
+            if noi_dung and "không tải" not in noi_dung:
+                luu_pdf(so_chuong, tieu_de, noi_dung, THU_MUC_LUU)
+                thanh_cong += 1
+                print(f"✅ Chương {so_chuong} ({thanh_cong}/{tong_so})")
+            else:
+                print(f"❌ Lỗi chương {so_chuong}")
+
+    print(f"\n--- HOÀN TẤT ---")
+    print(f"📚 Tổng số chương thành công: {thanh_cong}/{tong_so}")
+    print(f"🕒 Thời gian: {time.time() - start_time:.2f} giây")
+    print(f"📂 File PDF đã lưu tại: {os.path.abspath(THU_MUC_LUU)}")
